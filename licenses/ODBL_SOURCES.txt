@@ -1,0 +1,8 @@
+roads.bin: Overture Maps transportation/segment release 2026-09-23.1 (OpenStreetMap roads: motorway, trunk, primary, secondary, named avenues), python tools/bake_roads.py, baked 2026-10-01
+roadgraph.bin: Overture Maps transportation/segment release 2026-09-23.1 (OpenStreetMap roads: motorway, trunk, primary, secondary, named avenues, as a connected graph), python tools/bake_road_graph.py, baked 2026-10-01
+roadprof.bin: road profiles (deck heights, bridges, viaducts, tunnels) of every roadgraph.bin edge, solved on the base game terrain by tools/bake_road_profiles.gd (derived from roadgraph.bin: Overture Maps / OpenStreetMap, ODbL), baked 2026-10-01
+lakes.bin (data/world/, records 10 (Lake Ontario)) and the lake_field.bin tiles round them: shores inside tools/patch_lake_osm.py PATCHES windows from Overture Maps base.water release 2026-09-23.0 (OpenStreetMap, ODbL), python tools/patch_lake_osm.py, patched 2026-10-05
+city_water.bin: Overture Maps base.water release 2026-09-23.0 (OpenStreetMap water areas), python tools/bake_city_water.py, baked 2026-10-05
+coast_ov_osm.bin: Overture Maps base.water release 2026-09-23.0 (OpenStreetMap water areas), python tools/bake_city_water.py, baked 2026-10-05
+buildings/*.bin: Overture Maps buildings release 2026-09-23.1 (OpenStreetMap and other ODbL building footprints and heights; height estimates from 3D-GloBFP, Che et al. 2024, CC BY 4.0, Google Open Buildings 2.5D Temporal, CC BY 4.0, and GHSL GHS-BUILT-H R2023A, CC BY 4.0), python tools/fetch_heights.py fetch, python tools/bake_city_buildings.py, baked 2026-10-05
+green/*.bin: Overture Maps base land_use and land release 2026-09-23.1 (OpenStreetMap parks, gardens, grass, woods, cemeteries and trees), python tools/bake_city_green.py, baked 2026-10-05

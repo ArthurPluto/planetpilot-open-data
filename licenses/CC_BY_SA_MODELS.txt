@@ -1,0 +1,23 @@
+Two 3D models in Planet Pilot under CC BY-SA 3.0
+================================================
+
+The 3D models of Christ the Redeemer (assets/models/landmarks/christ_redeemer.glb
+inside the game) and of Mount Rushmore (assets/models/landmarks/mount_rushmore.glb)
+are adaptations of two photographs from Wikimedia Commons. They were made
+with TRELLIS.2 (Microsoft, MIT licence) from cropped copies of the photos and
+then modified (resized to real size, decimated, recoloured, given simple
+bases) by the developer.
+
+1. "Christ the Redeemer - Cristo Redentor" by Arne Mueseler (Arne Müseler)
+   https://commons.wikimedia.org/wiki/File:Christ_the_Redeemer_-_Cristo_Redentor.jpg
+   Licence: CC BY-SA 3.0 DE, https://creativecommons.org/licenses/by-sa/3.0/de/deed.en
+
+2. "Mount Rushmore detail view (100MP)" by Thomas Wolf, www.foto-tw.de
+   https://commons.wikimedia.org/wiki/File:Mount_Rushmore_detail_view_(100MP).jpg
+   Licence: CC BY-SA 3.0, https://creativecommons.org/licenses/by-sa/3.0/
+
+These two models (only these two, not the rest of the game) are offered
+under the Creative Commons Attribution-ShareAlike 3.0 licence:
+https://creativecommons.org/licenses/by-sa/3.0/legalcode
+You may copy, adapt and share them under its terms. The model files can be
+requested through https://planetpilot.world/open-data.
