@@ -80,6 +80,7 @@ Needs: duckdb (pip install duckdb), shapely, contourpy, mapbox_earcut,
 numpy, scipy, Pillow, and tools/bake_water_ov.py's output first.
 """
 import argparse
+import json
 import math
 import os
 import re
@@ -131,6 +132,18 @@ Q_INSIDE = -8.0  # toy m: the query raster saturates deeper inside the water
 MIN_LAKE_M2 = 250000.0  # real m2: the city lakes drawn (Central Park Reservoir, the Alster)
 SLIVER = 10.0  # toy m: water narrower than this after the cuts goes
 MIN_AREA = 3000.0  # toy m2: smaller separate bits of water go
+POOL_MAX = 50000.0  # toy m2: a separate piece of river / dock water under this, alone on dry land, goes (13.24)
+POOL_GAP = 15.0  # toy m: other city water or a lake this close joins a pool to it
+POOL_SEA = 4.0  # toy m: the sea this close joins a pool to it (a creek mouth); a sand strip wider than this does not
+# 13.24b: a pool is a real river (kept, however short or alone at 1/5) when an Overture waterway line of a
+# RIVER_LINES class (OSM waterway=river / stream / canal), a named waterway line of any class (a named drain or
+# ditch: Tamagawa Josui, the Hanazono) or a named river / stream / canal polygon comes within
+# POOL_EV of it, or a Natural Earth river line (rivers.bin, coarse) within POOL_EV_NE. Only the rest (an unnamed
+# river polygon no watercourse runs through: a culverted stub, a park basin tagged water=river) can go.
+POOL_EV = 10.0  # toy m
+POOL_EV_NE = 20.0  # toy m
+RIVER_LINES = ("river", "stream", "canal")  # (an unnamed ditch or drain is no evidence)
+EVIDENCE = os.path.join(WSRC, "pool_evidence")  # the evidence queries (parquet, one per box list)
 ISLAND_KEEP = 40.0
 MOUTH_RATIO = 1.5  # region mode: no widening from river cells whose width with the sea is over this x their own
 NE_NEAR = 300.0  # toy m
@@ -249,9 +262,12 @@ REGION_PAD = 0.02
 REGION_MARGIN = 0.1
 CHUNK_TILES = 5
 # original window water replaced: Singapore (the river mouth widening flooded Raffles Place), Toronto (baked against
-# the Natural Earth Lake Ontario before tools/patch_lake_osm.py: city water left in the lake, none in the harbour)
-REGION_FORCE = {"singapore", "toronto"}
-PART_VERSION = 5  # v5: Natural Earth chords dropped by their ends, city lakes count (drops below; v4 was a trial)
+# the Natural Earth Lake Ontario before tools/patch_lake_osm.py: city water left in the lake, none in the harbour),
+# Amsterdam (the IJ and the Westpoort harbours were a tidal sea carve, bake_water_ov.LOCKED_WATER; the canal ring
+# widened into one sheet, the region's "canal_min_m")
+# Kyiv and Odesa (kyiv-odesa): their landmark windows (5 km) would otherwise keep a hole of original-bake tiles
+REGION_FORCE = {"singapore", "toronto", "amsterdam", "kyiv", "odesa"}
+PART_VERSION = 7  # v7: river pools with a waterway line, a name or a Natural Earth river kept (13.24b); v6: lone river / dock pools dropped (drop_pools, 13.24); v5: Natural Earth chords dropped by their ends, city lakes count
 SUNK_M = -5.0  # real m: a Copernicus lake cell under this is a below-sea-level lake (drawn as sea)
 SUNK_GROW = 12  # cells (~280 real m): and its OSM shore round it
 
@@ -271,6 +287,19 @@ def water_boxes(rid):
         return []
     with open(p, encoding="utf-8") as f:
         return [tuple(b) for b in _j.load(f).get("water_boxes", [])]
+
+
+def region_opt(rid, key, default=None):
+    """A key of a region's tools/city_regions JSON (default when the region or the key is missing). "canal_min_m":
+    canal polygons (Overture canal / canal) under this mean real width (2 x area / perimeter) are not drawn: a canal
+    ring of 20 to 30 m canals 80 to 120 m apart (Amsterdam's grachtengordel) widened to WIDEN_MIN toy m each merges
+    into one sheet of water over the blocks between them; the streets of the building bake show the ring instead."""
+    import json as _j  # noqa: PLC0415
+    p = os.path.join(ROOT, "tools", "city_regions", str(rid) + ".json")
+    if not os.path.exists(p):
+        return default
+    with open(p, encoding="utf-8") as f:
+        return _j.load(f).get(key, default)
 
 
 def _tile_range(la0, lo0, la1, lo1):
@@ -477,6 +506,8 @@ def merge_parts(plan, out_path, cov_out):
             osm[k] = np.minimum(osm[k], v) if k in osm else v
     write_cwt1_raw(out_path, pieces, drops, tiles)
     wov.write_cov1(cov_out, {k: (wov.enc(v), None) for k, v in osm.items()})
+    # the original windows' carve behind sea locks (Amsterdam's IJ) goes too: the min merge above keeps it otherwise
+    wov.strip_locked(cov_out)
     print(f"merged {len(parts)} parts ({len(owned)} owned tiles): pieces {n0} -> {len(pieces)} ({n0 - n_base} replaced, "
           f"{len(pieces) - n_base} from the regions), {len(tiles)} query tiles, {len(drops)} NE drops, {len(osm)} carve "
           f"patches; {os.path.getsize(out_path) / 1e6:.2f} MB + {os.path.getsize(cov_out) / 1e6:.2f} MB", flush=True)
@@ -518,6 +549,7 @@ def fetch(win):
     for L, G in cop_degrees(la0 - 2.0 / PPD, lo0, la1, lo1 + 2.0 / PPD):  # (the grid's last row / column too)
         bd.fetch_cop(L, G)
     p = os.path.join(CACHE, f"{name}_{la0:.2f}_{lo0:.2f}_{la1:.2f}_{lo1:.2f}.parquet")
+    fetch_evidence([(la0, lo0, la1, lo1)], name)  # (13.24b: the waterway lines drop_pools keeps rivers by)
     if os.path.exists(p):
         return p
     import duckdb  # noqa: PLC0415
@@ -861,11 +893,154 @@ def lake_drops(water, kind, g, runways, sea, name, log):
     return out, n_all
 
 
+def fetch_evidence(boxes, tag):
+    """13.24b: the river evidence round (la0, lo0, la1, lo1) boxes: Overture water lines of a RIVER_LINES class (OSM
+    waterway=river / stream / canal, named or not), named water lines of any class and named river / stream / canal
+    polygons. One parquet per box
+    list (EVIDENCE/<tag>_<hash>.parquet: subtype, class, name, wkb)."""
+    import hashlib  # noqa: PLC0415
+    key = hashlib.sha1(repr((2, [tuple(round(float(v), 5) for v in b) for b in boxes])).encode()).hexdigest()[:10]
+    p = os.path.join(EVIDENCE, f"{tag}_{key}.parquet")
+    if os.path.exists(p):
+        return p
+    import duckdb  # noqa: PLC0415
+    os.makedirs(EVIDENCE, exist_ok=True)
+    con = duckdb.connect()
+    with _DUCK_LOCK:
+        con.execute("INSTALL httpfs; INSTALL spatial;")
+    con.execute("LOAD httpfs; LOAD spatial; SET s3_region='us-west-2';")
+    where = " OR ".join(f"(bbox.xmin < {lo1} AND bbox.xmax > {lo0} AND bbox.ymin < {la1} AND bbox.ymax > {la0})"
+                        for la0, lo0, la1, lo1 in boxes)
+    cls = ", ".join(f"'{c}'" for c in RIVER_LINES)
+    part = p + f".{os.getpid()}.{threading.get_ident()}.part"
+    q = f"""COPY (SELECT subtype, class, names.primary AS name, ST_AsWKB(geometry) AS wkb
+        FROM read_parquet('{S3}', hive_partitioning=1)
+        WHERE ({where}) AND (
+          (ST_GeometryType(geometry) IN ('LINESTRING', 'MULTILINESTRING') AND (class IN ({cls}) OR names.primary IS NOT NULL))
+          OR (ST_GeometryType(geometry) IN ('POLYGON', 'MULTIPOLYGON') AND names.primary IS NOT NULL
+              AND (subtype IN ('river', 'stream', 'canal') OR class IN ('river', 'riverbank', 'stream', 'canal')))))
+        TO '{part.replace(os.sep, '/')}' (FORMAT parquet)"""
+    for attempt in range(4):
+        try:
+            con.execute(q)
+            break
+        except Exception as e:  # noqa: BLE001 (network)
+            print(f"  evidence {tag}: query failed ({e}), retry {attempt + 1}", flush=True)
+            time.sleep(5 + attempt * 10)
+    else:
+        raise RuntimeError(f"Overture evidence query failed for {tag}")
+    os.replace(part, p)
+    return p
+
+
+class RiverEvidence:
+    """13.24b: why a pool is a real river ("" = no evidence): fetch_evidence's lines and named polygons, the Natural
+    Earth river lines. Geometries in lon / lat; distances in toy m (a local frame per test)."""
+
+    def __init__(self, paths, ne=True):
+        import duckdb  # noqa: PLC0415
+        import shapely  # noqa: PLC0415
+        self.geoms, self.labels, self.pads = [], [], []
+        for p in paths:
+            for st, cl, nm, wkb in duckdb.connect().execute(
+                    f"SELECT subtype, class, name, wkb FROM '{p.replace(os.sep, '/')}'").fetchall():
+                gm = shapely.from_wkb(bytes(wkb))
+                line = gm.geom_type in ("LineString", "MultiLineString")
+                self.geoms.append(gm)
+                self.labels.append(("%s line" % cl if line else "named %s" % (cl or st)) + (" " + nm if nm else ""))
+                self.pads.append(POOL_EV)
+        if ne:
+            head, deltas = read_rivers()
+            for pid in range(len(head)):
+                la, lo = piece_points(head, deltas, pid)
+                if len(la) >= 2:
+                    self.geoms.append(shapely.linestrings(np.column_stack([lo, la])))
+                    self.labels.append("Natural Earth river")
+                    self.pads.append(POOL_EV_NE)
+        self.tree = shapely.STRtree(self.geoms) if self.geoms else None
+
+    def why(self, geom):
+        import shapely  # noqa: PLC0415
+        if self.tree is None or geom is None or geom.is_empty:
+            return ""
+        c = geom.centroid
+        kx = TOY_PER_DEG * max(0.02, math.cos(math.radians(c.y)))
+        pad = POOL_EV_NE / kx
+
+        def toy(gm):
+            return shapely.transform(gm, lambda a: np.column_stack([(a[:, 0] - c.x) * kx, (a[:, 1] - c.y) * TOY_PER_DEG]))
+
+        me = toy(geom)
+        best = None
+        for i in self.tree.query(geom.buffer(pad)):
+            d = me.distance(toy(self.geoms[i]))
+            if d <= self.pads[i] and (best is None or d < best[0]):
+                best = (d, self.labels[i])
+        return "" if best is None else best[1]
+
+
+def evidence_mask(ev, g, img_size):
+    """drop_pools' evidence cells on a window grid: every RiverEvidence geometry grown by its pad."""
+    if ev is None or ev.tree is None:
+        return None
+    from shapely.geometry import box as sbox  # noqa: PLC0415
+    kx = max(0.02, math.cos(math.radians(g.lat1)))
+    win = sbox(g.lon0, g.lat1 - (img_size[1] - 1) / g.ppd, g.lon0 + (img_size[0] - 1) / g.ppd, g.lat1)
+    polys = []
+    for i in ev.tree.query(win.buffer(POOL_EV_NE / (TOY_PER_DEG * kx))):
+        gm = ev.geoms[i].buffer(ev.pads[i] / (TOY_PER_DEG * kx))
+        polys += list(gm.geoms) if gm.geom_type == "MultiPolygon" else [gm]
+    return raster_polys(polys, g, img_size) if polys else np.zeros((img_size[1], img_size[0]), bool)
+
+
+def drop_pools(water, kind, sea, ne_lakes, g, name, log, ev=None):
+    """13.24: the lone pools (a mask of the cells to drop). A separate piece of the city water (8-connected) under
+    POOL_MAX toy m2 whose source is river or dock water only (no cell of a pond, lake, reservoir or canal: those are
+    real even when small and alone) and that lies alone on dry land: no other city water or Natural Earth lake within
+    POOL_GAP, no sea within POOL_SEA. They were stubs the cuts left of a river (its middle drawn by Natural Earth,
+    a runway pad or the sea carve), basins of a tidal creek beside a sand strip (Newtown Creek), or a river polygon
+    the 1/5 ground squeezed into a dark puddle. 13.24b: never a real river: a pool ev (evidence_mask: a waterway line,
+    a named river polygon, a Natural Earth river) reaches stays, and without ev nothing goes. Each drop is logged
+    ("pool": lat, lon, toy m2) for review."""
+    lab, nl = ndimage.label(water, structure=np.ones((3, 3), bool))
+    gone = np.zeros(water.shape, bool)
+    if not nl:
+        return gone
+    cell = g.sy * g.sx
+    area = np.bincount(lab.ravel(), minlength=nl + 1) * cell
+    real = np.bincount(lab[(kind == K_LAKE) | (kind == K_CANAL)].ravel(), minlength=nl + 1) > 0
+    other = ne_lakes
+    rg = max(1, int(math.ceil(POOL_GAP / min(g.sx, g.sy))))
+    rs = max(1, int(math.ceil(POOL_SEA / min(g.sx, g.sy))))
+    for li, sl in enumerate(ndimage.find_objects(lab), start=1):
+        if sl is None or area[li] >= POOL_MAX or real[li]:
+            continue
+        r0 = max(sl[0].start - rg, 0)
+        c0 = max(sl[1].start - rg, 0)
+        win = (slice(r0, sl[0].stop + rg), slice(c0, sl[1].stop + rg))
+        me = lab[win] == li
+        near = ndimage.binary_dilation(me, structure=np.ones((3, 3), bool), iterations=rg)
+        if (near & ((water[win] & ~me) | other[win])).any():
+            continue
+        near_s = ndimage.binary_dilation(me, structure=np.ones((3, 3), bool), iterations=rs)
+        if (near_s & sea[win]).any():
+            continue
+        if ev is None or (me & ev[win]).any():
+            continue  # 13.24b: a real river (or no evidence read: then nothing goes)
+        gone[win] |= me
+        rr, cc = np.nonzero(me)
+        la = g.lat1 - (r0 + rr.mean()) / g.ppd
+        lo = g.lon0 + (c0 + cc.mean()) / g.ppd
+        log.append("pool %s %.5f %.5f %.0f" % (name, la, lo, area[li]))
+    return gone
+
+
 def bake_window(args):
     win, parquet, cov_path, lms, runways = args[:5]
     own = args[5] if len(args) > 5 else None  # region mode: the 0.1 deg tile keys this window outputs
     import duckdb  # noqa: PLC0415
     import shapely  # noqa: PLC0415
+    import shapely.affinity  # noqa: PLC0415
     from shapely.geometry import box as sbox  # noqa: PLC0415
     import contourpy  # noqa: PLC0415
     import mapbox_earcut as earcut  # noqa: PLC0415
@@ -885,6 +1060,7 @@ def bake_window(args):
         own_mask = np.ones((ny, nx), bool)
     rows = duckdb.connect().execute(f"SELECT subtype, class, is_intermittent, wkb FROM '{parquet.replace(os.sep, '/')}'").fetchall()
     by_kind = {K_RIVER: [], K_CANAL: [], K_DOCK: [], K_LAKE: []}
+    canal_min = float(region_opt(members[0], "canal_min_m", 0.0)) if own is not None else 0.0
     for st, cl, inter, wkb in rows:
         k = kind_of(st, cl)
         if k is None or (inter and k == K_LAKE):
@@ -892,6 +1068,11 @@ def bake_window(args):
         geom = shapely.from_wkb(bytes(wkb))
         parts = list(geom.geoms) if geom.geom_type == "MultiPolygon" else [geom]
         for p in parts:
+            if k == K_CANAL and canal_min > 0.0:
+                kx = math.cos(math.radians(p.centroid.y))
+                ps = shapely.affinity.scale(p, xfact=kx * M_PER_DEG, yfact=M_PER_DEG, origin=(0.0, 0.0))
+                if 2.0 * ps.area / max(ps.length, 1.0) < canal_min:
+                    continue
             if k == K_LAKE:
                 a = p.area * M_PER_DEG * M_PER_DEG * math.cos(math.radians(p.centroid.y))
                 if a < MIN_LAKE_M2:
@@ -942,7 +1123,10 @@ def bake_window(args):
     # tidal city water (at sea level by its source cell's DEM, joined to the
     # sea) is drawn as sea: the OSM carve (coast_ov_osm.bin), so a widened
     # tidal river is one body of water with the harbour carve
-    low = water & (dem[ir, ic] <= wov.LOW_M + 1.0) & ~sea
+    # (never behind sea locks: wov.LOCKED_WATER stays city water)
+    low = water & (dem[ir, ic] <= wov.LOW_M + 1.0) & ~sea & ~wov.locked_mask(g)
+    if own is not None and region_opt(members[0], "no_tidal", False):
+        low[:] = False  # (region JSON "no_tidal": a microtidal sea, its docks stay city water, no OSM carve)
     lab, _ = ndimage.label(low | sea, structure=np.ones((3, 3), bool))
     ids = np.unique(lab[sea])
     osm_carve = low & np.isin(lab, ids[ids > 0]) & ~wov.runway_mask(g, runways) & own_mask
@@ -983,6 +1167,12 @@ def bake_window(args):
         area = np.bincount(lab.ravel())[1:] * g.sy * g.sx
         water &= np.concatenate([[False], area >= MIN_AREA])[lab]
     del lab
+    try:
+        ev = RiverEvidence([fetch_evidence([(la0, lo0, la1, lo1)], name)])
+    except Exception as e:  # noqa: BLE001 (no evidence: drop_pools keeps every pool)
+        log.append(f"pool {name}: no river evidence ({e}), no pool dropped")
+        ev = None
+    water &= ~drop_pools(water, kind, sea, ne_lakes, g, name, log, evidence_mask(ev, g, (nx, ny)))
     sd = wov.signed_dist(water, g)
 
     # ---- query tiles
@@ -1360,6 +1550,145 @@ def main_regions(a):
     print(f"{time.time() - t0:.0f} s")
 
 
+def pool_rule(c):
+    """drop_pools' rule on one component of the shipped file (tools/city_pools_probe.gd's line: kinds, area, ne,
+    sea4): river / dock water only, under POOL_MAX, no Natural Earth water or lake field by it, no sea within
+    POOL_SEA (sea4)."""
+    return (all(int(k) in (K_RIVER, K_DOCK) for k in c["kinds"]) and float(c["area"]) < POOL_MAX
+            and not c.get("ne") and not c.get("sea4"))
+
+
+def comp_geom(pieces, pids):
+    """The lon / lat shape of city-water pieces (read_cwt1's): the union of their triangles."""
+    import shapely  # noqa: PLC0415
+    tris = []
+    for pid in pids:
+        h, vb, ib = pieces[pid]
+        a0, b0, a1, b1 = struct.unpack_from("<iiii", h)
+        v = np.frombuffer(vb, "<u2").reshape(-1, 3).astype(np.float64)
+        lat = (a0 + v[:, 0] / 65535.0 * max(a1 - a0, 1)) * 1e-5
+        lon = (b0 + v[:, 1] / 65535.0 * max(b1 - b0, 1)) * 1e-5
+        t = np.frombuffer(ib, "<u2").reshape(-1, 3)
+        tris.append(np.stack([np.column_stack([lon[t[:, j]], lat[t[:, j]]]) for j in range(3)], axis=1))
+    if not tris:
+        return None
+    return shapely.union_all(shapely.polygons(np.concatenate(tris)))
+
+
+def prune_pools(list_path, out_path, review_path=None):
+    """drop_pools on a city_water.bin already baked (13.24; a PC without the windows' Overture caches): the
+    components tools/city_pools_probe.gd lists (the game's own water: pieces whose bboxes come within 15 toy m are
+    one component, its shore tested against the sea, the Natural Earth water and the lake field) that pool_rule
+    drops lose their pieces, and their query raster cells turn dry (the signed distance round them measured again
+    from the water left, at the query grid). Pieces are matched by their bbox, not only their index."""
+    pieces, drops, tiles = read_cwt1(out_path)
+    comps = [json.loads(ln) for ln in open(list_path, encoding="utf-8") if ln.strip()]
+    # 13.24b: the river evidence round every pool the rule names; a pool with some is a real river and stays
+    cand = [c for c in comps if pool_rule(c)]
+    pad = (POOL_EV_NE + 20.0) / TOY_PER_DEG
+    boxes = [(c["bbox"][0] - pad, c["bbox"][1] - 2 * pad, c["bbox"][2] + pad, c["bbox"][3] + 2 * pad) for c in cand]
+    ev = RiverEvidence([fetch_evidence(boxes, "prune")]) if boxes else None
+    for c in cand:
+        c["why"] = ev.why(comp_geom(pieces, c["pids"]))
+    gone = [c for c in cand if not c["why"]]
+    kill = set()
+    for c in gone:
+        la0, lo0, la1, lo1 = c["bbox"]
+        for pid in c["pids"]:
+            a0, b0, a1, b1 = struct.unpack_from("<iiii", pieces[pid][0])
+            # (the probe read this very file: the bbox must be the piece's)
+            assert abs(a0 * 1e-5 - la0) < 0.05 and abs(b0 * 1e-5 - lo0) < 0.05, (pid, c)
+            kill.add(pid)
+    # the query raster: a 3 x 3 tile mosaic round every tile a dropped component reaches
+    n = TILE_C + 1
+    touched = set()
+    for c in gone:
+        la0, lo0, la1, lo1 = c["bbox"]
+        for ty in range(int(math.floor((90.0 - la1) / TILE_DEG)), int(math.floor((90.0 - la0) / TILE_DEG)) + 1):
+            for tx in range(int(math.floor((lo0 + 180.0) / TILE_DEG)), int(math.floor((lo1 + 180.0) / TILE_DEG)) + 1):
+                if ty * TILE_W + tx in tiles:
+                    touched.add((ty, tx, c["lat"], c["lon"], tuple(c["bbox"])))
+    by_tile = {}
+    for ty, tx, la, lo, bb in touched:
+        by_tile.setdefault((ty, tx), []).append(bb)
+    dec = {}
+
+    def tile_sd(ty, tx):
+        k = ty * TILE_W + tx
+        if k not in dec:
+            dec[k] = dec_q(np.frombuffer(zlib.decompress(tiles[k]), np.uint8).reshape(n, n)) if k in tiles else None
+        return dec[k]
+
+    new_tiles = {}
+    sy = TOY_PER_DEG / Q_PPD
+    for (ty, tx), bbs in sorted(by_tile.items()):
+        big = np.full((3 * TILE_C + 1, 3 * TILE_C + 1), Q_RANGE, np.float32)
+        for dj in (-1, 0, 1):
+            for di in (-1, 0, 1):
+                t = tile_sd(ty + dj, tx + di)
+                if t is not None:
+                    big[(dj + 1) * TILE_C:(dj + 1) * TILE_C + n, (di + 1) * TILE_C:(di + 1) * TILE_C + n] = t
+        lat_n = 90.0 - (ty - 1) * TILE_DEG
+        lon_w = (tx - 1) * TILE_DEG - 180.0
+        sx = sy * math.cos(math.radians(lat_n - 1.5 * TILE_DEG))
+        wet = big < 0.0
+        lab, _ = ndimage.label(wet, structure=np.ones((3, 3), bool))
+        rm = np.zeros(wet.shape, bool)
+        for la0, lo0, la1, lo1 in bbs:
+            pad = 20.0 / TOY_PER_DEG
+            r0 = max(int(math.floor((lat_n - la1 - pad) * Q_PPD)), 0)
+            r1 = min(int(math.ceil((lat_n - la0 + pad) * Q_PPD)) + 1, wet.shape[0])
+            c0 = max(int(math.floor((lo0 - pad - lon_w) * Q_PPD)), 0)
+            c1 = min(int(math.ceil((lo1 + pad - lon_w) * Q_PPD)) + 1, wet.shape[1])
+            inside = np.zeros(wet.shape, bool)
+            inside[r0:r1, c0:c1] = True
+            for lb in np.unique(lab[inside & wet]):
+                cells = lab == lb
+                if not (cells & ~inside).any():   # the whole blob inside the component's box
+                    rm |= cells
+        if not rm.any():
+            continue
+        left = wet & ~rm
+        d_left = ndimage.distance_transform_edt(~left, sampling=(sy, sx)) - 0.5 * min(sy, sx)
+        near = ndimage.binary_dilation(rm, iterations=int(math.ceil(Q_RANGE / min(sy, sx))) + 1)
+        upd = np.where(near & ~left, np.maximum(big, np.minimum(d_left, Q_RANGE)), big)
+        upd = np.where(rm, np.maximum(np.minimum(d_left, Q_RANGE), 0.5), upd)
+        for dj in (-1, 0, 1):
+            for di in (-1, 0, 1):
+                k = (ty + dj) * TILE_W + tx + di
+                if k not in tiles:
+                    continue
+                win = (slice((dj + 1) * TILE_C, (dj + 1) * TILE_C + n), slice((di + 1) * TILE_C, (di + 1) * TILE_C + n))
+                sub = upd[win] != big[win]
+                if not sub.any():
+                    continue
+                # (only the cells the drop changed: a tile's shared edge keeps its own bytes)
+                blk = tile_sd(ty + dj, tx + di).copy()
+                blk[sub] = upd[win][sub]
+                dec[k] = blk
+                new_tiles[k] = blk
+    for k, blk in new_tiles.items():
+        if blk.min() >= Q_RANGE:
+            tiles.pop(k, None)   # no water left in the tile
+        else:
+            tiles[k] = zlib.compress(enc_q(np.maximum(blk, Q_INSIDE)).tobytes(), 9)
+    kept = [pc for i, pc in enumerate(pieces) if i not in kill]
+    write_cwt1_raw(out_path, kept, drops, tiles)
+    print(f"prune_pools: {len(comps)} components listed, {len(cand)} pools by the rule, {len(cand) - len(gone)} of them "
+          f"real rivers (kept), {len(gone)} dropped ({len(kill)} pieces), "
+          f"{len(new_tiles)} query tiles changed; {out_path}", flush=True)
+    if review_path:
+        with open(review_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("region\tlat\tlon\tarea_toy_m2\tkinds\tverdict\n")
+            for c in sorted(comps, key=lambda c: (c["region"], -float(c["area"]))):
+                why = ("keep: " + c["why"]) if c.get("why") else "drop" if pool_rule(c) else (
+                    "keep: lake / canal" if any(int(k) in (K_LAKE, K_CANAL) for k in c["kinds"]) else
+                    "keep: big" if float(c["area"]) >= POOL_MAX else
+                    "keep: Natural Earth water by it" if c.get("ne") else "keep: joins the sea")
+                f.write("%s\t%.5f\t%.5f\t%.0f\t%s\t%s\n" % (c["region"], c["lat"], c["lon"], float(c["area"]),
+                                                          ",".join("rcdl"[int(k)] for k in c["kinds"]), why))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--jobs", type=int, default=4)
@@ -1373,8 +1702,13 @@ def main():
     ap.add_argument("--merge", action="store_true", help="region mode: merge the existing parts only")
     ap.add_argument("--force", action="store_true", help="region mode: re-bake parts that exist")
     ap.add_argument("--coverage", action="store_true", help="region mode: print the per-region water table")
+    ap.add_argument("--prune-pools", default="", metavar="LIST",
+                    help="drop_pools on --out as baked: LIST = tools/city_pools_probe.gd's components (13.24)")
+    ap.add_argument("--review", default="", help="--prune-pools: write the verdict per listed component here (TSV)")
     a = ap.parse_args()
     os.makedirs(LOG_DIR, exist_ok=True)
+    if a.prune_pools:
+        return prune_pools(a.prune_pools, a.out, a.review or None)
     if a.regions:
         return main_regions(a)
     wins = windows()

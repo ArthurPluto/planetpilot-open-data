@@ -91,6 +91,9 @@ F_YIELD = 1
 F_BANK = 2                        # stands on the city water's edge (a bank tower): the game checks only its centre
 BANK_NUDGE = 24.0                 # toy m: a footprint touching the city water moves at most this far landward
 BANK_DRY = 3.0                    # toy m: a bank tower that cannot clear stays when its centre is this far on land
+SEA_FOOT = 3.0                    # toy m: a footprint corner may reach this far over the sea (CityBuildings.SEA_FOOT)
+SEA_SLACK = 1.0                   # toy m: the bake keeps every corner this much inside the game's allowance
+SEA_DIST = os.environ.get("SEA_DIST") or os.path.join(ROOT, "data", "world", "src", "sea_dist")  # (tools/sea_dist_dump.gd)
 FLOOR_M = 3.3                     # storey height (num_floors x FLOOR_M)
 HOME_H = 52.0                     # Ma'agal HaShalom 1: 16 storeys, 52 m
 MAAGAL_R = 45.0                   # toy m round the home: the Ma'agal HaShalom block (every building there yields)
@@ -152,7 +155,7 @@ MAGIC = b"CBL1"
 
 # Region boxes (lat0, lon0, lat1, lon1) fetched from Overture. "poly" clips the kept set (lon, lat ring); "zones"
 # raise the detail (a smaller street gap, smaller buildings kept) inside boxes: (lat0, lon0, lat1, lon1, level)
-# with level 2 = the highest (Arthur's neighbourhood), 1 = high.
+# with level 3 = the densest (Odesa's centre: GAP / MIN_AREA below), 2 = very high (Arthur's neighbourhood), 1 = high.
 REGIONS = {
     "israel": {
         "box": (29.45, 34.20, 33.35, 35.92),
@@ -162,13 +165,10 @@ REGIONS = {
                  (35.89, 32.94), (35.80, 32.71), (35.57, 32.64), (35.55, 32.39), (35.57, 32.10), (35.53, 31.75),
                  (35.40, 31.50), (35.47, 31.10), (35.33, 30.55), (35.10, 29.95), (34.96, 29.49), (34.88, 29.52),
                  (34.27, 31.22)],
-        # Arthur's home: Ma'agal HaShalom 1, Rishon LeZion (OSM way 371637662); its footprint is always kept
-        "home": (31.9695, 34.7684),
-        "zones": [(31.9545, 34.7504, 31.9845, 34.7864, 2),   # Rishon LeZion: Ma'agal HaShalom, centred on home
-                  (31.935, 34.73, 32.00, 34.83, 1),      # Rishon LeZion
-                  (32.03, 34.74, 32.15, 34.85, 1),       # Tel Aviv
-                  (31.74, 35.17, 31.82, 35.25, 1),       # Jerusalem
-                  (32.76, 34.95, 32.84, 35.05, 1)],      # Haifa
+        # (v56) the four big cities are their own regions now (tools/city_regions/tel_aviv.json with Arthur's home
+        # and the Ma'agal HaShalom block, jerusalem, haifa, beer_sheva): their boxes are carved out of this ring
+        # (carve_regions(): a coastal box leaves a notch, an inland one a hole joined to the edge by a thin corridor)
+        "carve": ["tel_aviv", "jerusalem", "haifa", "beer_sheva"],
     },
     "moscow": {"box": (55.55, 37.30, 55.95, 37.95)},
     "nyc": {"box": (40.55, -74.10, 40.92, -73.70)},
@@ -183,7 +183,7 @@ REGIONS = {
 # file): {"box": [lat0, lon0, lat1, lon1], "poly": [[lon, lat], ...], "zones": [[lat0, lon0, lat1, lon1, level], ...]}
 # ("poly" and "zones" optional; any other keys are notes for people). A name already above is never overridden.
 REGIONS_DIR = os.path.join(ROOT, "tools", "city_regions")
-OVERRIDE_KEYS = ("height_fixes", "tower_fixes", "towers", "drop", "drops", "qid_fixes")
+OVERRIDE_KEYS = ("height_fixes", "tower_fixes", "towers", "drop", "drops", "qid_fixes", "block_fill", "h_caps", "prio_boost")
 if os.path.isdir(REGIONS_DIR):
     for _f in sorted(os.listdir(REGIONS_DIR)):
         if _f.endswith(".json") and _f[:-5] not in REGIONS:
@@ -194,6 +194,10 @@ if os.path.isdir(REGIONS_DIR):
                 _r["poly"] = [tuple(p) for p in _cfg["poly"]]
             if _cfg.get("zones"):
                 _r["zones"] = [tuple(z) for z in _cfg["zones"]]
+            if _cfg.get("home"):
+                _r["home"] = tuple(_cfg["home"])   # (Arthur's home: tel_aviv)
+            if _cfg.get("cover_min_area"):
+                _r["cover_min_area"] = float(_cfg["cover_min_area"])   # (write_region: no cover over sparse sheds: odesa)
             for _k in OVERRIDE_KEYS:
                 if _cfg.get(_k):
                     _r[_k] = _cfg[_k]
@@ -210,6 +214,19 @@ if os.path.isdir(REGIONS_DIR):
 #   "drop" / "drops": [[lat, lon, "note"], ...] or [{"lat", "lon", "r", "all", "reason"}]: the footprint at the point
 #       is removed (r m: every footprint with its centroid within r; "all": every footprint holding the point)
 #   "qid_fixes": {"Q123": h}: a Wikidata item's height (0 = skip the item)
+#   "h_caps": [[lat0, lon0, lat1, lon1, m], ...]: a GUESSED height (GHSL, 3D-GloBFP, Google 2.5D: no Overture
+#       height, no floors, no known tower) inside the box is at most m (every box holding the footprint applies).
+#       For a district whose real towers all carry floors and whose guesses spike (Odesa's centre: 3D-GloBFP puts
+#       60 m on two-storey courtyard houses)
+#   "prio_boost": [[lat0, lon0, lat1, lon1, kind, factor, "note"], ...]: inside the box the greedy order counts a
+#       footprint of that kind (0 residential, 1 commercial, 2 industrial, 3 civic) factor times as important, so a
+#       works district keeps its sheds and halls over its houses (Odesa's Peresyp)
+#   "block_fill": [{"box": [lat0, lon0, lat1, lon1] or "poly": [[lon, lat], ...], "name", "pitch": 113,
+#       "street": 20, "court": true}, ...]: a dense
+#       regular grid (Barcelona's Eixample) whose real-size footprints do not fit between its drawn streets on the
+#       1/5 ground (block_fill()): every block the drawn roads leave there becomes one perimeter block (two U halves
+#       round a courtyard, chamfered corners) at the height of the footprints that stand in it. pitch / street: the
+#       real block pitch and street width (m), for the streets the graph does not draw.
 FIXES_DIR = os.path.join(REGIONS_DIR, "fixes")
 if os.path.isdir(FIXES_DIR):
     for _f in sorted(os.listdir(FIXES_DIR)):
@@ -220,6 +237,44 @@ if os.path.isdir(FIXES_DIR):
                 if _cfg.get(_k):
                     _o = REGIONS[_f[:-5]].get(_k)
                     REGIONS[_f[:-5]][_k] = dict(_o or {}, **_cfg[_k]) if _k == "qid_fixes" else list(_o or []) + list(_cfg[_k])
+
+# "carve": [ids]: those regions' boxes (the ones that exist) are cut out of this region's poly, so the city regions
+# inside a country region (Israel) own their ground. A box that reaches over the ring's edge leaves a notch; one inside
+# it a hole, joined to the outside by a CARVE_W degree corridor east along the box's south edge (the ring stays one
+# simple ring for region_at and the green clip).
+CARVE_W = 0.004
+
+
+def carve_regions():
+    try:
+        import shapely
+    except ImportError:   # (a tool run without shapely: the rings stay whole)
+        print("bake_city_buildings: no shapely, region carve skipped", file=sys.stderr)
+        return
+    for _n, _c in REGIONS.items():
+        ids = [i for i in _c.get("carve", []) if i in REGIONS and i != _n]
+        if not ids or "poly" not in _c:
+            continue
+        ring = shapely.Polygon(_c["poly"])
+        far = _c["box"][3] + 1.0
+        for i in ids:
+            la0, lo0, la1, lo1 = REGIONS[i]["box"]
+            cut = ring.difference(shapely.box(lo0, la0, lo1, la1))
+            if not isinstance(cut, shapely.Polygon) or len(cut.interiors):
+                cut = cut.difference(shapely.box(lo1 - 1e-9, la0, far, la0 + CARVE_W))
+            if not isinstance(cut, shapely.Polygon):
+                cut = max(shapely.get_parts(cut), key=lambda g: g.area)
+            ring = cut
+        pts = []
+        for x, y in list(ring.exterior.coords)[:-1]:
+            q = (round(x, 6), round(y, 6))
+            if not pts or q != pts[-1]:
+                pts.append(q)
+        _c["poly"] = pts
+        _c["carved"] = ids
+
+
+carve_regions()
 
 # CITY_OUT: write the bake somewhere else (a worker's trial bake): the output base folder
 if os.environ.get("CITY_OUT"):
@@ -558,6 +613,94 @@ class CityWater:
             none = (a[j, i] == 255) & (a[j, i + 1] == 255) & (a[j + 1, i] == 255) & (a[j + 1, i + 1] == 255)
             out[sel] = np.where(none, 1e9, d)
         return out
+
+
+SEA = None                        # the SeaDist of a bake (main)
+
+
+class SeaDist:
+    """The game's signed coast distance (toy m, + land) round the detailed cities: tools/sea_dist_dump.gd's SDQ1
+    files (data/world/src/sea_dist/<region>.bin, the city water query grid). 1e9 where no file holds the tile (inland,
+    or the dump was not run: then no sea nudge, as before 13.24)."""
+
+    def __init__(self, folder=SEA_DIST):
+        self.index = {}
+        self.tiles = {}
+        self.qn = 241
+        if not os.path.isdir(folder):
+            return
+        for fn in sorted(os.listdir(folder)):
+            if not fn.endswith(".bin"):
+                continue
+            b = open(os.path.join(folder, fn), "rb").read()
+            if b[:4] != b"SDQ1":
+                continue
+            _v, n, self.qn = struct.unpack_from("<III", b, 4)
+            o = 16
+            for _ in range(n):
+                k, sz = struct.unpack_from("<II", b, o)
+                self.index[k] = b[o + 8:o + 8 + sz]
+                o += 8 + sz
+
+    def _tile(self, k):
+        import numpy as np
+        a = self.tiles.get(k)
+        if a is None:
+            blob = self.index[k]
+            try:
+                raw = zlib.decompress(blob)
+            except zlib.error:
+                raw = zlib.decompress(blob, -15)
+            a = np.frombuffer(raw, "<f4").reshape(self.qn, self.qn)
+            self.tiles[k] = a
+        return a
+
+    def dist(self, lat, lon):
+        import numpy as np
+        lat = np.asarray(lat, np.float64)
+        lon = np.asarray(lon, np.float64)
+        out = np.full(len(lat), 1e9, np.float32)
+        if not self.index:
+            return out
+        tx = np.floor((lon + 180.0) / 0.1).astype(np.int64)
+        ty = np.floor((90.0 - lat) / 0.1).astype(np.int64)
+        key = ty * 3600 + tx
+        for k in np.unique(key):
+            k = int(k)
+            if k not in self.index:
+                continue
+            a = self._tile(k)
+            sel = np.nonzero(key == k)[0]
+            u = (lon[sel] + 180.0 - tx[sel] * 0.1) * 2400.0
+            v = (90.0 - lat[sel] - ty[sel] * 0.1) * 2400.0
+            i = np.clip(np.floor(u).astype(np.int64), 0, self.qn - 2)
+            j = np.clip(np.floor(v).astype(np.int64), 0, self.qn - 2)
+            fx = np.clip(u - i, 0, 1)
+            fy = np.clip(v - j, 0, 1)
+            out[sel] = (a[j, i] * (1 - fx) + a[j, i + 1] * fx) * (1 - fy) + (a[j + 1, i] * (1 - fx) + a[j + 1, i + 1] * fx) * fy
+        return out
+
+
+class BankWater:
+    """The city water and the sea as one distance for water_banks (13.24): the sea counts SEA_FOOT - SEA_SLACK toy m
+    nearer than WATER_MARGIN, so a corner is wet when it reaches more than that over the sea (the game drops a
+    footprint with a corner SEA_FOOT over it) and a waterfront footprint steps landward off the sea too."""
+
+    def __init__(self, water, sea):
+        self.water = water
+        self.sea = sea
+
+    def dist(self, lat, lon):
+        import numpy as np
+        d = self.water.dist(lat, lon)
+        if self.sea is None or not self.sea.index:
+            return d
+        return np.minimum(d, self.sea.dist(lat, lon) + (WATER_MARGIN + SEA_FOOT - SEA_SLACK))
+
+    def dist_c(self, lat, lon):
+        """A footprint's centre: the city water only (its 0.3 sqrt(area) margin is no sea rule: the game tests the
+        corners against the sea, and a centre over the sea has corners there too)."""
+        return self.water.dist(lat, lon)
 
 
 # ---------------------------------------------------------------- known towers (Wikidata, CC0)
@@ -905,12 +1048,13 @@ ROOF_MAP = {"flat": R_FLAT, "gabled": R_GABLE, "saltbox": R_GABLE, "gambrel": R_
             "hipped": R_HIP, "half_hipped": R_HIP, "mansard": R_HIP, "side_hipped": R_HIP,
             "pyramidal": R_PYR, "dome": R_DOME, "onion": R_DOME, "round": R_DOME, "spherical": R_DOME}
 # share of small houses with a pitched roof (Overture rarely says), and gable vs hip
-PITCHED = {"israel": (0.12, R_GABLE), "moscow": (0.35, R_HIP), "nyc": (0.55, R_GABLE), "dubai": (0.03, R_HIP),
+PITCHED = {"israel": (0.12, R_GABLE), "tel_aviv": (0.05, R_GABLE), "jerusalem": (0.06, R_GABLE),
+           "haifa": (0.1, R_GABLE), "beer_sheva": (0.03, R_GABLE), "moscow": (0.35, R_HIP), "nyc": (0.55, R_GABLE), "dubai": (0.03, R_HIP),
            "london": (0.9, R_GABLE), "lasvegas": (0.85, R_HIP), "sf": (0.45, R_GABLE), "bangkok": (0.55, R_HIP)}
 FIELD_CLASSES = ["stadium", "grandstand", "sports_hall", "sports_centre", "pavilion", "parking", "carport", "roof",
                  "hangar", "storage_tank", "silo", "greenhouse", "shelter", "toilets"]
-MIN_AREA = (50.0, 35.0, 25.0)     # m2, by zone level
-GAP = (6.0, 4.5, 3.5)             # street gap between kept footprints (toy m), by zone level
+MIN_AREA = (50.0, 35.0, 25.0, 20.0)     # m2, by zone level
+GAP = (6.0, 4.5, 3.5, 2.5)              # street gap between kept footprints (toy m), by zone level
 ROAD_MARGIN = 3.0                 # past a drawn deck edge
 WATER_MARGIN = 2.0                # off the city water (toy m)
 MAX_PTS = 40
@@ -966,7 +1110,7 @@ def water_banks(water, X, Y, lc, li, area, lat_ref, lon_ref, K, bad, tower, toy,
         np.minimum.at(mind, li[sv], dv)
         dc = np.full(n, 1e9, np.float32)
         cla = lat_ref + Y[sub] / K
-        dc[sub] = water.dist(cla, lon_ref + X[sub] / (K * np.cos(np.radians(cla))))
+        dc[sub] = getattr(water, "dist_c", water.dist)(cla, lon_ref + X[sub] / (K * np.cos(np.radians(cla))))
         return mind, dc
 
     def d_at(x, y):
@@ -1005,6 +1149,21 @@ def water_banks(water, X, Y, lc, li, area, lat_ref, lon_ref, K, bad, tower, toy,
     shifted = (X != X0) | (Y != Y0)
     # a tower that still touches: the better of its real and its moved spot, kept when the centre is dry enough
     bank = wet & tower & ~bad & (np.maximum(dc, dc0) >= BANK_DRY)
+    sea = getattr(water, "sea", None)
+    if sea is not None and sea.index and bank.any():
+        # a bank tower is checked at its centre against the city water only; the game's footprint sea test still
+        # sees every corner, so a tower over the sea is no bank tower (it is dropped here: another may stand)
+        sub = bank.copy()
+        sv = sub[li]
+        ok = []
+        for Xs, Ys in ((X0, Y0), (X, Y)):
+            vla = lat_ref + (lc[sv, 1] + Ys[li[sv]]) / K
+            ds = sea.dist(vla, lon_ref + (lc[sv, 0] + Xs[li[sv]]) / (K * np.cos(np.radians(vla))))
+            ms = np.full(n, 1e9, np.float32)
+            np.minimum.at(ms, li[sv], ds)
+            ok.append(ms >= -(SEA_FOOT - SEA_SLACK))
+        # (the spot the bank rule keeps, the better of real and moved, must be the sea-free one)
+        bank &= np.where(dc > dc0, ok[1], ok[0])
     back = shifted & ((wet & ~bank) | (bank & (dc0 >= dc)))
     if tree is not None:
         # a moved building that is no tower must not land on a drawn road
@@ -1026,6 +1185,124 @@ def water_banks(water, X, Y, lc, li, area, lat_ref, lon_ref, K, bad, tower, toy,
                             for i in ki], dtype=object)
     wet &= ~bank
     return wet, bank, int((keep & ~bank).sum())
+
+
+FILL_MARGIN = 1.5                 # toy m past a drawn deck edge round a filled block (the game clears 1)
+FILL_MIN_A = 40.0                 # toy m2: the smallest filled block
+FILL_IMPORTANT_H = 40.0           # a kept building this tall (or a civic, named or yield one) is never replaced
+
+
+def block_fill(cfg, lines, water, lat_ref, lon_ref, K, X, Y, toy, h, kind, kept, important, wet):
+    """The region's "block_fill" boxes: ([(toy polygon, height, kind)] new blocks, the kept indices they replace).
+    The free ground of a box (the box less the drawn roads, FILL_MARGIN past their decks) splits into pieces; a
+    piece longer than the real grid pitch / SCALE is cut into cells of that pitch (a street the graph does not
+    draw); a cell holding source footprints (at their 1/5 spots) becomes a chamfered block, a perimeter ring of
+    two U halves round a courtyard when it is big enough, at the median height of its footprints. A cell touching
+    a kept important building (towers, landmarks, civic) stays as baked; plain kept ones in a filled cell go."""
+    import numpy as np
+    import shapely
+    out = []
+    drop = set()
+    fills = cfg.get("block_fill") or []
+    kept = np.asarray(kept, np.int64)
+    ktree = shapely.STRtree(toy[kept]) if len(kept) else None
+
+    def txy(lat, lon):
+        return (lon - lon_ref) * K * math.cos(math.radians(lat)), (lat - lat_ref) * K
+
+    for f in fills:
+        pitch = float(f.get("pitch", 113.0)) / SCALE
+        street = float(f.get("street", 20.0)) / SCALE
+        court = bool(f.get("court", True))
+        chamfer = bool(f.get("chamfer", True))     # (Barcelona's xamfrans; Odesa's corners are square)
+        max_h = float(f.get("max_h", 45.0))
+        h_pct = float(f.get("h_pct", 50.0))           # the block's height: this percentile of its footprints'
+                                                      # (over 50: the street fronts, not the low yard sheds)
+        court_min = float(f.get("court_min", 12.0))   # toy m: the shortest side that gets a courtyard
+        if "poly" in f:
+            bpoly = shapely.Polygon([txy(q[1], q[0]) for q in f["poly"]])
+        else:
+            la0, lo0, la1, lo1 = f["box"]
+            bpoly = shapely.Polygon([txy(la0, lo0), txy(la0, lo1), txy(la1, lo1), txy(la1, lo0)])
+        bx0, by0, bx1, by1 = bpoly.bounds
+        roads = []
+        for arr, half in lines:
+            xs = (arr[:, 1] - lon_ref) * K * np.cos(np.radians(arr[:, 0]))
+            ys = (arr[:, 0] - lat_ref) * K
+            if xs.max() < bx0 - 30 or xs.min() > bx1 + 30 or ys.max() < by0 - 30 or ys.min() > by1 + 30:
+                continue
+            roads.append(shapely.buffer(shapely.linestrings(np.column_stack([xs, ys])), half + FILL_MARGIN, quad_segs=2))
+        free = shapely.difference(bpoly, shapely.union_all(roads)) if roads else bpoly
+        inb = np.nonzero(~wet & (X >= bx0) & (X <= bx1) & (Y >= by0) & (Y <= by1))[0]
+        n_new = n_rep = 0
+        for piece in shapely.get_parts(free):
+            if piece.area < FILL_MIN_A:
+                continue
+            # cells along the piece's own axes (the grid's orientation)
+            c = np.asarray(shapely.oriented_envelope(piece).exterior.coords)[:4]
+            e1, e2 = c[1] - c[0], c[3] - c[0]
+            l1, l2 = float(np.linalg.norm(e1)), float(np.linalg.norm(e2))
+            if l1 < 1e-6 or l2 < 1e-6:
+                continue
+            u1, u2 = e1 / l1, e2 / l2
+            n1 = max(1, int(round((l1 + street) / pitch)))
+            n2 = max(1, int(round((l2 + street) / pitch)))
+            s1 = (l1 - street * (n1 - 1)) / n1
+            s2 = (l2 - street * (n2 - 1)) / n2
+            for a1 in range(n1):
+                for a2 in range(n2):
+                    o = c[0] + u1 * a1 * (s1 + street) + u2 * a2 * (s2 + street)
+                    cell = shapely.Polygon([o, o + u1 * s1, o + u1 * s1 + u2 * s2, o + u2 * s2])
+                    blk = shapely.intersection(cell, piece)
+                    if blk.is_empty or blk.area < FILL_MIN_A:
+                        continue
+                    if blk.geom_type != "Polygon":
+                        blk = max(shapely.get_parts(blk), key=lambda g: g.area)
+                        if blk.geom_type != "Polygon" or blk.area < FILL_MIN_A:
+                            continue
+                    mem = inb[shapely.contains_xy(blk, X[inb], Y[inb])]
+                    if len(mem) == 0:
+                        continue # a square, a park, a yard: left open
+                    # chamfered corners (the Eixample's xamfrans): an inset, then a bevelled outset
+                    short = min(s1, s2)
+                    ch = max(1.0, 0.15 * short)
+                    blk = blk.buffer(-ch, join_style="mitre").buffer(ch - 0.5, join_style="bevel" if chamfer else "mitre")
+                    if blk.is_empty or blk.geom_type != "Polygon" or blk.area < FILL_MIN_A:
+                        continue
+                    blk = shapely.simplify(blk, 0.3)
+                    vx = np.asarray(blk.exterior.coords)
+                    vla = lat_ref + vx[:, 1] / K
+                    if water is not None and (water.dist(vla, lon_ref + vx[:, 0] / (K * np.cos(np.radians(vla))))
+                                              < WATER_MARGIN).any():
+                        continue
+                    hit = kept[ktree.query(blk.buffer(1.0), predicate="intersects")] if ktree is not None else []
+                    if any(important[j] for j in hit):
+                        continue
+                    drop.update(int(j) for j in hit)
+                    n_rep += len(hit)
+                    hh = float(np.clip(np.percentile(h[mem], h_pct), 6.0, max_h))
+                    kk = kind[mem]
+                    kk = kk[kk != K_TALL]
+                    kd = int(np.bincount(kk).argmax()) if len(kk) else K_RES
+                    parts = [blk]
+                    if court and short >= court_min:
+                        yard = blk.buffer(-max(3.5, 0.28 * short), join_style="mitre")
+                        if not yard.is_empty and yard.geom_type == "Polygon" and yard.area >= 0.06 * blk.area:
+                            rg = shapely.difference(blk, yard)
+                            pv = np.array([blk.centroid.x, blk.centroid.y])
+                            big = 4.0 * (l1 + l2)
+                            # (two U halves: the record holds one ring, no holes)
+                            ha = shapely.Polygon([pv - u1 * big, pv + u1 * big, pv + u1 * big - u2 * big, pv - u1 * big - u2 * big])
+                            hb = shapely.Polygon([pv - u1 * big, pv + u1 * big, pv + u1 * big + u2 * big, pv - u1 * big + u2 * big])
+                            halves = [shapely.intersection(rg, ha), shapely.intersection(rg, hb)]
+                            if all(g.geom_type == "Polygon" and len(g.interiors) == 0 for g in halves):
+                                parts = [shapely.simplify(g, 0.3) for g in halves]
+                    for g in parts:
+                        if g.geom_type == "Polygon" and 3 <= len(g.exterior.coords) - 1 <= MAX_PTS:
+                            out.append((shapely.orient_polygons(g), hh, kd))
+                            n_new += 1
+        log("block fill %s: %d parts, %d kept footprints replaced" % (f.get("name", "-"), n_new, n_rep))
+    return out, drop
 
 
 def bake_region(name, ghsl, water):
@@ -1240,6 +1517,11 @@ def bake_region(name, ghsl, water):
     slab = (src == 0) & (area >= SLAB_A[1]) & (h > SLAB_OV_H) & ~(has_f & (flo * FLOOR_M >= 0.6 * h)) & (named == None)  # noqa: E711
     h = np.where(slab, SLAB_OV_H, h)
     notes.append("sanity: %d lone spikes to the GHSL guess, %d huge Overture slabs capped" % (int(sp.sum()), int(slab.sum())))
+    for e in cfg.get("h_caps") or []:
+        ca0, co0, ca1, co1, cm = (float(v) for v in e[:5])   # (a sixth item is a note)
+        cap = (clat >= ca0) & (clat <= ca1) & (clon >= co0) & (clon <= co1) & np.isin(src, (2, 4, 6)) & (named == None) & (h > cm)  # noqa: E711
+        h = np.where(cap, float(cm), h)
+        notes.append("h_caps %.3f, %.3f, %.3f, %.3f: %d guessed heights to %.0f m" % (ca0, co0, ca1, co1, int(cap.sum()), cm))
     if os.environ.get("CITY_DEBUG"):
         os.makedirs(os.environ["CITY_DEBUG"], exist_ok=True)
         with open(os.path.join(os.environ["CITY_DEBUG"], name + "_rules.txt"), "w", encoding="utf-8") as f:
@@ -1310,7 +1592,7 @@ def bake_region(name, ghsl, water):
     # the drawn water (the Nile Corniche, Raffles Place, Puerto Madero). One that touches it moves landward (down
     # the water's distance gradient) up to BANK_NUDGE toy m; a tower (YIELD_M, a known or the home) that still
     # touches stays where its centre is BANK_DRY on land: the water yields (F_BANK, the game checks its centre only)
-    wet, bank, n_nudged = water_banks(water, X, Y, lc, li, area, lat_ref, lon_ref, K, bad,
+    wet, bank, n_nudged = water_banks(BankWater(water, SEA), X, Y, lc, li, area, lat_ref, lon_ref, K, bad,
                                       yld | (named != None) | home, toy, tree if lines else None)  # noqa: E711
     n_water = int((wet & ~bad).sum())
     bad |= wet
@@ -1321,6 +1603,12 @@ def bake_region(name, ghsl, water):
     prio = h * np.sqrt(area) * np.where((kind == K_TALL) | (named != None), 1000.0, np.where(yld, 100.0, 1.0))  # noqa: E711
     # the towers of TALL_M and up by height alone (a wide 228 m block must not beat the 310 m tower beside it)
     prio = np.where(h >= TALL_M, 1e8 * h, prio)
+    for e in cfg.get("prio_boost") or []:
+        ba0, bo0, ba1, bo1 = (float(v) for v in e[:4])
+        pb = (clat >= ba0) & (clat <= ba1) & (clon >= bo0) & (clon <= bo1) & (kind == int(e[4])) & (h < TALL_M)
+        prio = np.where(pb, prio * float(e[5]), prio)
+        notes.append("prio_boost %.3f, %.3f, %.3f, %.3f kind %d x%.1f: %d footprints" % (ba0, bo0, ba1, bo1, int(e[4]),
+                                                                                      float(e[5]), int(pb.sum())))
     prio = np.where(home, 1e12, prio)
     bad &= ~home
     bad |= late
@@ -1357,9 +1645,52 @@ def bake_region(name, ghsl, water):
             for cx in range(int(math.floor(x0 / C)), int(math.floor(x1 / C)) + 1):
                 grid.setdefault((cx, cy), []).append(i)
     kept = np.array(sorted(kept, key=lambda i: (-prio[i], ids[i])), np.int64)
+    # dense grids (block_fill): the blocks between the drawn streets, one perimeter block each
+    if cfg.get("block_fill"):
+        imp = yld | (named != None) | (kind == K_CIV) | (h >= FILL_IMPORTANT_H) | home | bank  # noqa: E711
+        new, gone = block_fill(cfg, lines or [], water, lat_ref, lon_ref, K, X, Y, toy, h, kind, kept, imp, wet)
+        if new:
+            kept = np.array([i for i in kept if int(i) not in gone], np.int64)
+            m = len(new)
+            gp = [g for g, _, _ in new]
+            cx = np.array([g.centroid.x for g in gp])
+            cy = np.array([g.centroid.y for g in gp])
+            nloc = np.empty(m, dtype=object)
+            nloc[:] = [shapely.transform(g, lambda q, o=(x, y): q - np.array(o)) for g, x, y in zip(gp, cx, cy)]
+            nid = np.array(["fill-%s-%d" % (name, j) for j in range(m)], dtype=object)
+            ntoy = np.empty(m, dtype=object)
+            ntoy[:] = gp
+            nnone = np.empty(m, dtype=object)
+            nnone[:] = None
+            base = n_cand
+            ids = np.concatenate([ids, nid])
+            loc = np.concatenate([loc, nloc])
+            toy = np.concatenate([toy, ntoy])
+            X = np.concatenate([X, cx])
+            Y = np.concatenate([Y, cy])
+            clat = lat_ref + Y / K
+            clon = lon_ref + X / (K * np.cos(np.radians(clat)))
+            h = np.concatenate([h, np.array([v for _, v, _ in new])])
+            kind = np.concatenate([kind, np.array([v for _, _, v in new], np.uint8)])
+            roof = np.concatenate([roof, np.full(m, R_FLAT, np.uint8)])
+            hsh = np.concatenate([hsh, hash01(list(nid))])
+            yld = np.concatenate([yld, np.zeros(m, bool)])
+            home = np.concatenate([home, np.zeros(m, bool)])
+            bank = np.concatenate([bank, np.zeros(m, bool)])
+            named = np.concatenate([named, nnone])
+            names = np.concatenate([names, nnone])
+            src = np.concatenate([src, np.zeros(m, np.int64)])
+            bad = np.concatenate([bad, np.zeros(m, bool)])
+            wet = np.concatenate([wet, np.zeros(m, bool)])
+            kept = np.concatenate([kept, base + np.arange(m)])
+            n_cand += m
     if os.environ.get("CITY_DEBUG"):
         kk = np.zeros(n_cand, bool)
         kk[kept] = True
+        # every candidate (position, height, footprint area, kind, kept, dropped by a road or the water) for the
+        # district probes (CITY_DEBUG/<region>_cands.npz)
+        np.savez_compressed(os.path.join(os.environ["CITY_DEBUG"], name + "_cands.npz"), lat=clat, lon=clon, h=h,
+                            area=np.array([g.area for g in toy]), kind=kind, kept=kk, bad=bad, wet=wet, src=src)
         lost = [i for i in np.nonzero(~kk & ((h >= 150.0) | (named != None)))[0]]  # noqa: E711
         with open(os.path.join(os.environ["CITY_DEBUG"], name + "_rules.txt"), "a", encoding="utf-8") as f:
             for i in sorted(lost, key=lambda i: -h[i]):
@@ -1389,6 +1720,7 @@ def write_region(R):
     import shapely
     tiles = {}   # key -> [buildings, max h]
     cover = set()
+    cells = {}   # (gy, gx) -> kept footprint area in the cover cell (m2)
     towers = []
     cfg = REGIONS[R["name"]]
     n = 0
@@ -1413,13 +1745,22 @@ def write_region(R):
         n += 1
         gy = int(math.floor((lat + 90.0) * COVER_PD))
         gx = int(math.floor((lon + 180.0) * COVER_PD))
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                cover.add((gy + dy) * 360 * COVER_PD + (gx + dx))
+        cells[(gy, gx)] = cells.get((gy, gx), 0.0) + float(shapely.area(R["loc"][i]))
         if R["h"][i] >= TOWER_LIST_M:
             nm = R["named"][i] or R["names"][i] or ""
             towers.append([R["name"], nm, round(lat, 6), round(lon, 6), round(float(R["h"][i]), 1),
                            HEIGHT_SOURCES[int(R["src"][i])]])
+    # cover: every kept building's cell and its 8 neighbours (the urban ground, no town icons). "cover_min_area"
+    # (region JSON, m2, default 0): such a cell counts only when the 3 x 3 block round IT (about 280 x 280 toy m) holds
+    # that much kept footprint, so a few lone sheds, garages or dachas in the fields (Odesa's old airfield, the steppe
+    # edge) leave the terrain's own field there instead of a paved or garden town ground, while a yard or square
+    # between built blocks and one big works hall still count
+    cmin = float(cfg.get("cover_min_area", 0.0))
+    near = set((gy + dy, gx + dx) for (gy, gx) in cells for dy in (-1, 0, 1) for dx in (-1, 0, 1))
+    for (gy, gx) in near:
+        if cmin > 0.0 and sum(cells.get((gy + dy, gx + dx), 0.0) for dy in (-1, 0, 1) for dx in (-1, 0, 1)) < cmin:
+            continue
+        cover.add(gy * 360 * COVER_PD + gx)
     keys = sorted(tiles)
     blobs = []
     recs = []
@@ -1456,6 +1797,168 @@ def write_region(R):
     log("wrote %s: %d buildings, %d tiles, %d cover cells, %.2f MB, sha256 %s" % (
         path, n, n_t, len(cover), len(out) / 1e6, hashlib.sha256(out).hexdigest()[:16]))
     return towers
+
+
+def seafix(names):
+    """13.24: the sea rule of water_banks (BankWater) applied to region files already baked, for a PC without the
+    region's source caches (Overture, building parts, 3D-GloBFP / Google 2.5D heights): every kept footprint with a
+    corner over SEA_FOOT - SEA_SLACK toy m into the sea (tools/sea_dist_dump.gd's SeaDist, the game's own coast) or
+    its centre in it steps landward along the sea distance gradient, at most BANK_NUDGE toy m in all, and must not
+    land on the city water (F_BANK towers: their centre only, BANK_DRY) nor, unless it is a tower (F_YIELD or
+    YIELD_M), on a drawn road, nor within TALL_GAP of another kept footprint. One that cannot clear stays as it was (the game drops it, as before). Only the tile
+    payloads of the moved footprints change (counts, cover cells and towers stay); the index is rebuilt after."""
+    import numpy as np
+    import shapely
+    from shapely import STRtree
+    sea = SeaDist()
+    if not sea.index:
+        raise SystemExit("seafix: no sea distance in %s (run tools/sea_dist_dump.gd first)" % SEA_DIST)
+    water = CityWater()
+    K = M_PER_DEG
+    lim = -(SEA_FOOT - SEA_SLACK)
+    tot = [0, 0, 0, 0]
+    for name in names:
+        path = region_pack.region_path(OUT_DIR, name)
+        if not os.path.exists(path):
+            log("seafix %s: no %s" % (name, path))
+            continue
+        b = bytes(open(path, "rb").read())
+        magic, ver, n_t, n_r, regions_off, cover_off, n_cov, _ = struct.unpack_from("<4sIIIIIII", b, 0)
+        assert magic == MAGIC and ver == VERSION, path
+        la0, lo0, la1, lo1 = REGIONS[name]["box"]
+        lat_ref, lon_ref = (la0 + la1) * 0.5, (lo0 + lo1) * 0.5
+        recs = [list(struct.unpack_from("<IIIIIHHfI", b, 32 + 32 * t)) for t in range(n_t)]
+        tree = None
+        blobs = {}
+        # every kept footprint of the region (region frame), so a moved one never lands on a neighbour
+        fps = []
+        for r in recs:
+            ty, tx = divmod(r[0], 360 * TPD)
+            lat_t, lon_t = ty / TPD - 90.0, tx / TPD - 180.0
+            cos_t = math.cos(math.radians(lat_t + 0.5 / TPD))
+            raw = zlib.decompress(b[r[1]:r[1] + r[2]])
+            aq = np.frombuffer(raw[12 * r[3]:12 * r[3] + 4 * r[4]], "<i2").reshape(-1, 2).astype(np.float64) * Q
+            for i in range(r[3]):
+                first, np_ = struct.unpack_from("<HB", raw, 12 * i)
+                q = aq[first:first + np_]
+                vla = lat_t + q[:, 1] / K
+                fps.append(shapely.Polygon(np.column_stack([(lon_t + q[:, 0] / (K * cos_t) - lon_ref) * K * np.cos(np.radians(vla)),
+                                                            (vla - lat_ref) * K])).buffer(0))
+        fp_tree = STRtree(np.array(fps, dtype=object)) if fps else None
+        st = [0, 0, 0, 0]   # over the sea, moved, left (the game drops them), of them towers
+        for t, r in enumerate(recs):
+            key, off, nb, nbld, npt = r[:5]
+            ty, tx = divmod(key, 360 * TPD)
+            lat_t, lon_t = ty / TPD - 90.0, tx / TPD - 180.0
+            cos_t = math.cos(math.radians(lat_t + 0.5 / TPD))
+            raw = bytearray(zlib.decompress(b[off:off + nb]))
+            heads = [struct.unpack_from("<HBBHHBBH", raw, 12 * i) for i in range(nbld)]
+            po = 12 * nbld
+            allq = np.frombuffer(bytes(raw[po:po + 4 * npt]), "<i2").reshape(-1, 2).astype(np.float64) * Q
+            if not len(allq):
+                continue
+            # one vectorised pass over the tile's corners first: most tiles have nothing over the sea
+            dall = sea.dist(lat_t + allq[:, 1] / K, lon_t + allq[:, 0] / (K * cos_t))
+            if dall.min() >= lim:
+                continue
+            changed = False
+            base = sum(recs[u][3] for u in range(t))
+            for i, hd in enumerate(heads):
+                first, np_, kd, hq, _z, rf, sh, fl = hd
+                q = allq[first:first + np_]
+                ds = dall[first:first + np_]
+                c = q.mean(axis=0)
+
+                def cll(dx, dy, c=c):
+                    return np.array([lat_t + (c[1] + dy) / K]), np.array([lon_t + (c[0] + dx) / (K * cos_t)])
+
+                cs = sea.dist(*cll(0.0, 0.0))[0]
+                if ds.min() >= lim and cs > 0.0:
+                    continue
+                st[0] += 1
+                bank = bool(fl & F_BANK)
+                tower = bool(fl & F_YIELD) or hq * 0.1 >= YIELD_M
+                dx = dy = moved = 0.0
+                ok = False
+                vla = vlo = None
+                for _ in range(6):
+                    e = 3.0
+                    g = np.array([sea.dist(*cll(dx + e, dy))[0] - sea.dist(*cll(dx - e, dy))[0],
+                                  sea.dist(*cll(dx, dy + e))[0] - sea.dist(*cll(dx, dy - e))[0]])
+                    gn = float(np.hypot(g[0], g[1]))
+                    if gn < 1e-3 or abs(g).max() > 1e8:
+                        break
+                    step = min(max(lim - float(ds.min()), -float(cs) + 0.5, 0.0) + 1.0, BANK_NUDGE - moved)
+                    if step <= 0.25:
+                        break
+                    dx += g[0] / gn * step
+                    dy += g[1] / gn * step
+                    moved += step
+                    vla = lat_t + (q[:, 1] + dy) / K
+                    vlo = lon_t + (q[:, 0] + dx) / (K * cos_t)
+                    ds = sea.dist(vla, vlo)
+                    cs = sea.dist(*cll(dx, dy))[0]
+                    if ds.min() >= lim and cs > 0.0:
+                        ok = True
+                        break
+                if ok:
+                    # off the sea onto the city water: no
+                    if bank:
+                        ok = water.dist(*cll(dx, dy))[0] >= BANK_DRY
+                    else:
+                        ok = water.dist(vla, vlo).min() >= WATER_MARGIN and water.dist(*cll(dx, dy))[0] >= WATER_MARGIN
+                if ok and not tower:
+                    if tree is None:
+                        geos = []
+                        for arr, half in road_lines(REGIONS[name]["box"]):
+                            xs = (arr[:, 1] - lon_ref) * K * np.cos(np.radians(arr[:, 0]))
+                            ys = (arr[:, 0] - lat_ref) * K
+                            geos.append(shapely.buffer(shapely.linestrings(np.column_stack([xs, ys])), half + ROAD_MARGIN,
+                                                       quad_segs=2))
+                        tree = STRtree(np.array(geos, dtype=object)) if geos else False
+                    if tree:
+                        xs = (vlo - lon_ref) * K * np.cos(np.radians(vla))
+                        ys = (vla - lat_ref) * K
+                        if len(tree.query(shapely.Polygon(np.column_stack([xs, ys])), predicate="intersects")):
+                            ok = False
+                if ok:
+                    # nor on another kept footprint (TALL_GAP apart)
+                    xs = (vlo - lon_ref) * K * np.cos(np.radians(vla))
+                    ys = (vla - lat_ref) * K
+                    me = shapely.Polygon(np.column_stack([xs, ys])).buffer(TALL_GAP)
+                    hit = fp_tree.query(me, predicate="intersects")
+                    if any(int(h) != base + i for h in hit):
+                        ok = False
+                qn = np.round((q + np.array([dx, dy])) / Q).astype(np.int64)
+                if ok and (qn.min() < -32768 or qn.max() > 32767):
+                    ok = False
+                if not ok:
+                    st[2] += 1
+                    st[3] += int(tower)
+                    continue
+                st[1] += 1
+                raw[po + 4 * first:po + 4 * (first + np_)] = qn.astype("<i2").tobytes()
+                changed = True
+            if changed:
+                blobs[t] = zlib.compress(bytes(raw), 9)
+        if blobs:
+            data_off = cover_off + 4 * n_cov
+            out = bytearray(b[:data_off])
+            pos = data_off
+            body = bytearray()
+            for t, r in enumerate(recs):
+                blob = blobs.get(t, b[r[1]:r[1] + r[2]])
+                r[1], r[2] = pos, len(blob)
+                struct.pack_into("<IIIIIHHfI", out, 32 + 32 * t, *r)
+                body += blob
+                pos += len(blob)
+            out += body
+            region_pack.write_atomic(path, bytes(out))
+        log("seafix %s: %d over the sea, %d moved landward, %d left (%d towers); %s" % (
+            name, st[0], st[1], st[2], st[3], "rewrote %s (%d tiles)" % (path, len(blobs)) if blobs else "unchanged"))
+        for k in range(4):
+            tot[k] += st[k]
+    log("seafix: %d over the sea, %d moved landward, %d left (%d towers)" % tuple(tot))
 
 
 def write_index_and_towers(towers):
@@ -1551,7 +2054,7 @@ def info(path=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["fetch", "bake", "info", "index"])
+    ap.add_argument("cmd", choices=["fetch", "bake", "info", "index", "seafix"])
     ap.add_argument("path", nargs="?", default=None)
     ap.add_argument("--only", default="")
     a = ap.parse_args()
@@ -1566,12 +2069,20 @@ def main():
         fetch_ghsl(names)
         ghsl = Ghsl()
         water = CityWater()
+        global SEA
+        SEA = SeaDist()
+        log("sea distance: %d tiles from %s" % (len(SEA.index), SEA_DIST) if SEA.index else
+            "sea distance: none in %s (run tools/sea_dist_dump.gd): no sea nudge" % SEA_DIST)
         # one region at a time: its arrays are freed before the next one's are made
         towers = {}
         for n in names:
             towers[n] = write_region(bake_region(n, ghsl, water))
         write_index_and_towers(towers)
         write_sources()
+        info()
+    elif a.cmd == "seafix":
+        seafix(names)
+        write_index_and_towers({})
         info()
     elif a.cmd == "index":
         write_index_and_towers({})

@@ -127,6 +127,45 @@ TREE_GAP = {K_POND: 99.0, K_PARK: 11.0, K_GRASS: 22.0, K_WOOD: 8.0, K_CEM: 11.0,
 SCATTER = {K_POND: 0.0, K_PARK: 1.0 / 200.0, K_GRASS: 1.0 / 2600.0, K_WOOD: 1.0 / 110.0, K_CEM: 1.0 / 220.0, K_GOLF: 1.0 / 900.0}
 BLD_CLEAR = 2.5           # toy m: a tree keeps this far off a kept building footprint
 T_STREET, T_PARK, T_WOOD = 0, 1, 2
+# per region extras (the cities whose OpenStreetMap tagging or street trees need them; other regions unchanged):
+#   lu / land: more source classes -> (kind, min real m2) (Odesa tags its big parks as protected landscapes,
+#     drawn as wooded parks (their canopy is closed):
+#     Shevchenko Park, Victory Park, the Dyukivsky and City Gardens, the Botanical Garden; sanatorium grounds as
+#     resorts; the coastal slopes as scrub)
+#   named: source names -> (kind, min real m2), whatever their class
+#   drop: boxes (lat0, lon0, lat1, lon1) whose green (centre inside) is not drawn
+#   gap / scatter: tree gap (toy m) and park scatter density by kind instead of TREE_GAP / SCATTER
+#   street: street-tree rows along the city's own streets (Overture segments, cache
+#     data/world/src/overture/roadgraph/city_<region>_segments.parquet from tools/roadgraph_city_streets.py fetch):
+#     every `step` toy m on both sides of every way of `classes`, `off_drawn` toy m from the centre line of a way
+#     the road graph draws (its half width + this: the trunk on the verge; the region's look file sets
+#     green.kerb_trees so Forest lets the crowns hang over the street), `off` from the others (`pedestrian` ways:
+#     rows at each of `off_ped`), `bld` toy m off a building (not BLD_CLEAR), thinned by `gap` (`gap_core` in the
+#     `core` boxes); `avenues`: named ways with their own rows (`offs` each side, every `step`, thinned by `gap`),
+#     first in the thinning, also inside the green and not kept off the buildings (the ones by Primorsky Boulevard
+#     stand on its landmarks' grounds, the game drops them)
+REGION_GREEN = {
+    "odesa": {
+        "lu": {"protected_landscape_seascape": (K_WOOD, 5000.0), "resort": (K_PARK, 5000.0)},
+        "land": {"scrub": (K_GRASS, 8000.0)},
+        # by name, any class: the Chornomorets stadium's grounds in Shevchenko Park are wooded round the bowl (the
+        # landmark keeps its trees PARK_LM_GAP off the structure)
+        "named": {"Чорноморець": (K_WOOD, 5000.0)},
+        # the real UKOO airfield's grass: the game moved the airport 20 km away (REAL_PLACEMENT 13.24), its mown
+        # strips read as bright green bands among the Cheryomushky blocks
+        "drop": [[46.403, 30.650, 46.446, 30.702]],
+        "gap": {K_PARK: 6.0, K_WOOD: 6.0, K_CEM: 8.0},
+        "scatter": {K_PARK: 1.0 / 40.0, K_WOOD: 1.0 / 45.0, K_CEM: 1.0 / 120.0},
+        "street": {"classes": ("primary", "secondary", "tertiary", "residential", "living_street", "unclassified",
+                               "pedestrian"),
+                   "step": 4.0, "off": 3.5, "off_ped": (2.5, 6.5), "off_drawn": 2.0, "bld": 0.6, "gap": 7.5, "gap_core": 5.0,
+                   "core": [[46.452, 30.700, 46.500, 30.770], [46.400, 30.725, 46.452, 30.775]],
+                   # boulevards with their own tree rows (first in the thinning): Primorsky Boulevard's plane-tree
+                   # rows from the Vorontsov Palace to City Hall, French Boulevard's planes
+                   "avenues": [{"name": "Приморський бульвар", "offs": (2.0, 5.5), "step": 2.5, "gap": 3.5},
+                               {"name": "Французький бульвар", "offs": (7.0,), "step": 3.0, "gap": 4.0}]},
+    },
+}
 M_PER_DEG = cb.M_PER_DEG  # toy m per degree
 
 
@@ -210,9 +249,11 @@ def load_region(name, cover):
     by_kind = {k: [] for k in PRIORITY}
     con = duckdb.connect()
     trees = []
-    for typ, table in (("land_use", LU_CLASS), ("land", LAND_CLASS)):
+    rg = REGION_GREEN.get(name, {})
+    for typ, table in (("land_use", dict(LU_CLASS, **rg.get("lu", {}))), ("land", dict(LAND_CLASS, **rg.get("land", {})))):
         path = cache_path(name, typ).replace("\\", "/")
-        tb = con.execute("SELECT subtype, class, wkb FROM read_parquet('%s')" % path).fetchnumpy()
+        tb = con.execute("SELECT subtype, class, wkb, name FROM read_parquet('%s')" % path).fetchnumpy()
+        nms = np.asarray(tb["name"], dtype=object)
         cls = np.asarray(tb["class"], dtype=object)
         sub = np.asarray(tb["subtype"], dtype=object)
         geoms = shapely.from_wkb(np.array([bytes(w) for w in tb["wkb"]], dtype=object))
@@ -229,13 +270,18 @@ def load_region(name, cover):
         poly = (gt == 3) | (gt == 6)
         for i in np.nonzero(poly)[0]:
             c = cls[i]
-            if c not in table:
+            named = rg.get("named", {}).get(nms[i] if isinstance(nms[i], str) else "")
+            if c not in table and named is None:
                 continue
-            kind, min_m2 = table[c]
+            kind, min_m2 = named if named is not None else table[c]
             g = geoms[i]
             am2 = shapely.area(g) * kx * ky
             if am2 < min_m2 or am2 > MAX_M2.get(name, MAX_M2["*"]).get(kind, 1e12):
                 continue
+            if rg.get("drop"):
+                c = g.centroid
+                if any(b[0] <= c.y <= b[2] and b[1] <= c.x <= b[3] for b in rg["drop"]):
+                    continue
             by_kind[kind].append(g)
     # park lakes and ponds: water polygons that lie in the green (the Serpentine, the Round Pond)
     tb = con.execute("SELECT wkb FROM read_parquet('%s')" % cache_path(name, "water").replace(chr(92), "/")).fetchnumpy()
@@ -282,10 +328,11 @@ def load_region(name, cover):
     return out, tr, city
 
 
-def scatter_trees(green, seed):
+def scatter_trees(green, seed, scatter=None):
     """Random tree candidates inside the green polygons by kind: [(lat, lon, type, kind)]."""
     import numpy as np
     import shapely
+    scatter = scatter or SCATTER
     rng = np.random.default_rng(seed)
     out = []
     for k, g in sorted(green.items()):
@@ -294,7 +341,7 @@ def scatter_trees(green, seed):
             lat_c = (y0 + y1) * 0.5
             kx = M_PER_DEG * math.cos(math.radians(lat_c))
             area_toy = shapely.area(poly) * kx * M_PER_DEG
-            n = rng.poisson(area_toy * SCATTER[k])
+            n = rng.poisson(area_toy * scatter[k])
             if n == 0:
                 continue
             m = int(n * (x1 - x0) * (y1 - y0) / max(shapely.area(poly), 1e-12) * 1.3) + 4
@@ -339,6 +386,102 @@ def thin(points, lat_ref):
     return kept
 
 
+def street_rows(name, cfg, city, allg):
+    """Street-tree row candidates [(lat, lon, T_STREET, gap)] along the city's own streets (REGION_GREEN street):
+    both sides of every way, off the drawn graph roads' ribbons, inside the city, outside the green (the parks
+    have their own)."""
+    import duckdb
+    import numpy as np
+    import shapely
+    path = os.path.join(SRC, "overture", "roadgraph", "city_%s_segments.parquet" % name)
+    if not os.path.exists(path):
+        raise SystemExit("%s: no street cache %s (tools/roadgraph_city_streets.py fetch %s)" % (name, path, name))
+    la0, lo0, la1, lo1 = cb.REGIONS[name]["box"]
+    lat_ref = (la0 + la1) * 0.5
+    kx = M_PER_DEG * math.cos(math.radians(lat_ref))
+    ky = M_PER_DEG
+    con = duckdb.connect()
+    cl = ", ".join("'%s'" % c for c in cfg["classes"])
+    tb = con.execute("SELECT class, wkb, road_flags FROM read_parquet('%s') WHERE class IN (%s) ORDER BY id" % (
+        path.replace(chr(92), "/"), cl)).fetchall()
+    # the drawn graph roads (toy xy), for the offset of a way that runs along one
+    drawn = [(shapely.LineString(np.column_stack([a[:, 1] * kx, a[:, 0] * ky])), h) for a, h in cb.road_lines((la0, lo0, la1, lo1))]
+    dtree = shapely.STRtree([d[0] for d in drawn]) if drawn else None
+    core = shapely.union_all([shapely.box(b[1] * kx, b[0] * ky, b[3] * kx, b[2] * ky) for b in cfg.get("core", [])])         if cfg.get("core") else None
+    city_xy = shapely.transform(city, lambda c: c * np.array([kx, ky]))
+    green_xy = shapely.transform(allg, lambda c: c * np.array([kx, ky])) if allg is not None else None
+    shapely.prepare(city_xy)
+    if green_xy is not None:
+        shapely.prepare(green_xy)
+    out_xy = []
+    out_gap = []
+    # the avenues first: their own rows and gap, any class, kept in the green too
+    av_rows = []
+    for av in cfg.get("avenues", []):
+        rows = con.execute("SELECT wkb FROM read_parquet('%s') WHERE name = ? ORDER BY id" % path.replace(chr(92), "/"),
+                           [av["name"]]).fetchall()
+        for (wkb,) in rows:
+            g = shapely.from_wkb(bytes(wkb))
+            if g.geom_type != "LineString":
+                continue
+            ln = shapely.LineString(np.asarray(g.coords) * np.array([kx, ky]))
+            n = max(1, int(ln.length / av["step"]))
+            for off in av["offs"]:
+                for side in (-1.0, 1.0):
+                    o = ln.offset_curve(side * off, quad_segs=2, join_style="mitre", mitre_limit=2.0)
+                    if o.is_empty or o.length < 1.0:
+                        continue
+                    p = shapely.get_coordinates(shapely.line_interpolate_point(o, (np.arange(n) + 0.5) / n, normalized=True))
+                    av_rows += [(float(y / ky), float(x / kx), T_STREET, float(av["gap"])) for x, y in p]
+    for cls, wkb, flags in tb:
+        if any(set(f["values"]) & {"is_tunnel", "is_bridge", "is_covered", "is_indoor"} for f in (flags or [])):
+            continue
+        g = shapely.from_wkb(bytes(wkb))
+        if g.geom_type != "LineString":
+            continue
+        ln = shapely.LineString(np.asarray(g.coords) * np.array([kx, ky]))
+        if ln.length < 3.0:
+            continue
+        offs = cfg["off_ped"] if cls == "pedestrian" else (cfg["off"],)
+        if dtree is not None and cls != "pedestrian":
+            hit = dtree.query(ln, predicate="dwithin", distance=4.0)
+            if len(hit):
+                # the share of the way that runs on a drawn road: its rows go past the ribbon and verge
+                mid = shapely.line_interpolate_point(ln, [0.25, 0.5, 0.75], normalized=True)
+                best = None
+                for j in hit:
+                    d = shapely.distance(mid, drawn[j][0]).max()
+                    if d < 4.0 and (best is None or drawn[j][1] > best):
+                        best = drawn[j][1]
+                if best is not None:
+                    offs = (best + cfg["off_drawn"],)
+        n = max(1, int(ln.length / cfg["step"]))
+        for off in offs:
+            for side in (-1.0, 1.0):
+                try:
+                    o = ln.offset_curve(side * off, quad_segs=2, join_style="mitre", mitre_limit=2.0)
+                except Exception:
+                    continue
+                if o.is_empty or o.length < 1.0:
+                    continue
+                f = (np.arange(n) + 0.5) / n
+                p = shapely.get_coordinates(shapely.line_interpolate_point(o, f, normalized=True))
+                out_xy.append(p)
+    if not out_xy:
+        return av_rows, len(av_rows)
+    xy = np.vstack(out_xy)
+    ok = shapely.contains_xy(city_xy, xy[:, 0], xy[:, 1])
+    if green_xy is not None:
+        ok &= ~shapely.contains_xy(green_xy, xy[:, 0], xy[:, 1])
+    xy = xy[ok]
+    gap = np.full(len(xy), cfg["gap"])
+    if core is not None:
+        gap[shapely.contains_xy(core, xy[:, 0], xy[:, 1])] = cfg["gap_core"]
+    # deterministic order: core first (denser rows win the thinning), then by position
+    order = np.lexsort((xy[:, 0], xy[:, 1], gap))
+    return av_rows + [(float(xy[i, 1] / ky), float(xy[i, 0] / kx), T_STREET, float(gap[i])) for i in order], len(av_rows)
+
+
 def bake_region(name, cover, brings):
     import numpy as np
     import shapely
@@ -348,13 +491,23 @@ def bake_region(name, cover, brings):
     lat_ref = (la0 + la1) * 0.5
     # trees: the real ones first (street trees and the parks' own), then the scatter, each with its gap
     allg = shapely.union_all(list(green.values())) if green else None
+    rg = REGION_GREEN.get(name, {})
+    gaps = {**TREE_GAP, **rg.get("gap", {})}
     pts = []
     if len(street):
         ig_all = shapely.contains_xy(allg, street[:, 1], street[:, 0]) if allg is not None else np.zeros(len(street), bool)
         for (lat, lon, _t), ig in zip(street, ig_all):
-            pts.append((float(lat), float(lon), T_PARK if ig else T_STREET, TREE_GAP[K_PARK] if ig else TREE_GAP_STREET))
-    sc = scatter_trees(green, sum(map(ord, name)))
-    pts += [(lat, lon, t, TREE_GAP[k]) for (lat, lon, t, k) in sc]
+            pts.append((float(lat), float(lon), T_PARK if ig else T_STREET, gaps[K_PARK] if ig else TREE_GAP_STREET))
+    n_rows = 0
+    row0 = len(pts)
+    n_av = 0
+    if "street" in rg:
+        rows, n_av = street_rows(name, rg["street"], city, allg)
+        n_rows = len(rows)
+        pts += rows
+    row_clear = rg.get("street", {}).get("bld", BLD_CLEAR)
+    sc = scatter_trees(green, sum(map(ord, name)), {**SCATTER, **rg.get("scatter", {})})
+    pts += [(lat, lon, t, gaps[k]) for (lat, lon, t, k) in sc]
     # off the kept buildings (BLD_CLEAR), tile by tile
     keep = np.ones(len(pts), bool)
     arr = np.array([(p[0], p[1]) for p in pts], np.float64).reshape(-1, 2)
@@ -378,13 +531,23 @@ def bake_region(name, cover, brings):
             px = shapely.points(arr[sel, 1] * kxx, arr[sel, 0] * M_PER_DEG)
             hit = tree.query(px, predicate="dwithin", distance=BLD_CLEAR)
             if hit.size:
-                keep[sel[np.unique(hit[0])]] = False
+                hp = sel[hit[0]]
+                rowp = (hp >= row0) & (hp < row0 + n_rows)
+                if row_clear < BLD_CLEAR and rowp.any():
+                    # street rows: only `bld` off a building
+                    d = shapely.distance(px[hit[0][rowp]], np.array(polys, dtype=object)[hit[1][rowp]])
+                    rowp[np.nonzero(rowp)[0][d >= row_clear]] = False
+                    keep[np.unique(hp[~((hp >= row0) & (hp < row0 + n_rows))])] = False
+                    keep[np.unique(hp[rowp])] = False
+                else:
+                    keep[np.unique(hp)] = False
+    keep[row0:row0 + n_av] = True   # the avenues' rows: the buildings in their way stand on landmark grounds
     n_cand = len(pts)
     pts = [p for p, k in zip(pts, keep) if k]
     trees = thin(pts, lat_ref)
     km2 = {k: round(shapely.area(g) * 111320.0 ** 2 * math.cos(math.radians(lat_ref)) / 1e6, 2) for k, g in green.items()}
-    log("%s: green real km2 by kind %s, %d trees kept of %d candidates (%d off buildings, %d real points) (%.0f s)" % (
-        name, km2, len(trees), n_cand, n_cand - len(pts), len(street), time.time() - t0))
+    log("%s: green real km2 by kind %s, %d trees kept of %d candidates (%d off buildings, %d real points, %d street "
+        "row points) (%.0f s)" % (name, km2, len(trees), n_cand, n_cand - len(pts), len(street), n_rows, time.time() - t0))
     return {"name": name, "green": green, "trees": trees, "box": (la0, lo0, la1, lo1)}
 
 
